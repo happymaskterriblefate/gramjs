@@ -5,7 +5,8 @@ import { generateRandomBytes, readBigIntFromBuffer, sleep } from "../Helpers";
 import { getAppropriatedPartSize, getInputMedia, getMessageId } from "../Utils";
 import { EntityLike, FileLike, MarkupLike, MessageIDLike } from "../define";
 import path from "./path";
-import { promises as fs } from "./fs";
+import { promises as fs } from "fs";
+import { Readable } from 'stream'
 import { errors, utils } from "../index";
 import { _parseMessageText } from "./messageParse";
 import { getCommentData } from "./messages";
@@ -33,6 +34,187 @@ export interface UploadFileParams {
     maxBufferSize?: number;
 }
 
+interface UploadPart {
+    /** Part number for this upload */
+    partNumber: number;
+
+    /** Buffer for this part */
+    buffer: Buffer;
+}
+class UploadHandler {
+    /** File to upload */
+    file: File | CustomFile;
+
+    /** id for this file */
+    id: bigInt.BigInteger;
+
+    /** size of chunks to be uploaded */
+    partSize: number;
+
+    /** number of chunks to be uploaded */
+    partCount: number;
+
+    /** Readable stream used to stream data for upload */
+    stream: Readable | null;
+
+    /** flag for when the stream has reached the end */
+    done: boolean;
+
+    /** Part number read */
+    partNumber: number;
+
+    /** Number of successfully upload */
+    uploadedParts: number;
+
+    /** Number of simultaneous upload jobs */
+    workers: number;
+
+    /** Number of bytes read so far */
+    bytesRead: number;
+
+    /** File size of file */
+    filesize: number;
+
+    /** Progress callback */
+    onProgress?: OnProgress;
+
+    /** is the file large */
+    isLarge: boolean;
+
+    constructor(file: File | CustomFile, workers?: number, onProgress?: OnProgress) {
+        // Handle other types later
+        this.file = file;
+        this.id = readBigIntFromBuffer(generateRandomBytes(8), true, true);
+        this.stream = null;
+        this.partSize = 0;
+        this.partCount = 0;
+        this.done = false;
+        this.isLarge = false;
+        this.partNumber = 0;
+        this.uploadedParts = 0;
+        this.bytesRead = 0;
+        this.filesize = 0;
+        this.workers = workers || 1;
+        this.onProgress = onProgress;
+    }
+
+    async setup() {
+        const isBrowserFile = typeof File !== "undefined" && this.file instanceof File;
+        // Browser
+        if (isBrowserFile) {
+            const fileBuffer = await (new Response(this.file as File).arrayBuffer() as Promise<Buffer>);
+            this.filesize = fileBuffer.byteLength;
+            this.stream = Readable.from(fileBuffer)
+        // Node
+        } else if (this.file instanceof CustomFile) {
+            this.filesize = this.file.size;
+        }
+
+        this.partSize = getAppropriatedPartSize(bigInt(this.filesize)) * KB_TO_BYTES;
+        this.partCount = Math.ceil(this.filesize  / this.partSize);
+        this.isLarge = this.filesize > LARGE_FILE_THRESHOLD;
+        this.workers = Math.min(this.workers, this.partCount);
+
+        if (this.stream === null && this.file instanceof CustomFile) {
+            // Buffer
+            if (this.file.buffer !== undefined) {
+                this.stream = Readable.from(this.file.buffer)
+
+            // File system
+            } else {
+                this.stream = (await fs.open(this.file.path)).createReadStream({
+                    highWaterMark: this.partSize * KB_TO_BYTES * 2
+                });
+            }
+        }
+    }
+
+    async waitForReadableStream() {
+        return new Promise((resolve) => this.stream?.once('readable', resolve));
+    }
+
+    async start(client: TelegramClient): Promise<Array<void>> {
+        const worker = (): Promise<void> => {
+            if (!this.done) {
+                return this.uploadPart(client).then(worker)
+            }
+            return Promise.resolve();
+        }
+
+        await this.setup();
+
+        return Promise.all(Array.from({ length: this.workers }).map(worker))
+    }
+
+    async uploadPart(client: TelegramClient, part?: UploadPart): Promise<void> {
+        if (this.done) return;
+
+        // We always upload from the DC we are in
+        const sender = await client.getSender(
+            client.session.dcId
+        );
+
+        part = part || await this.getChunk();
+
+        if (!part.buffer) return;
+
+        try {
+            await sender.send(
+                this.isLarge ?
+                    new Api.upload.SaveBigFilePart({
+                            fileId: this.id,
+                            filePart: part.partNumber,
+                            fileTotalParts: this.partCount,
+                            bytes: part.buffer,
+                    }) :
+                    new Api.upload.SaveFilePart({
+                            fileId: this.id,
+                            filePart: part.partNumber,
+                            bytes: part.buffer,
+                        })
+            );
+
+            this.uploadedParts += 1;
+
+            if (this.onProgress) {
+                this.onProgress(this.uploadedParts / this.partCount)
+            }
+        } catch (err) {
+            if (sender && !sender.isConnected()) {
+                await sleep(DISCONNECT_SLEEP);
+                return this.uploadPart(client, part);
+            } else if (err instanceof errors.FloodWaitError) {
+                await sleep(err.seconds * 1000);
+                return this.uploadPart(client, part);
+            }
+            throw err;
+        }
+    }
+
+    async getChunk(): Promise<UploadPart> {
+        let buffer;
+        if (this.filesize - this.bytesRead > this.partSize) {
+            buffer = await this.stream?.read(this.partSize);
+        } else {
+            buffer = await this.stream?.read();
+        }
+
+        if (buffer) {
+            this.bytesRead += buffer.byteLength;
+            this.done = this.bytesRead >= this.filesize;
+
+            return {
+                partNumber: this.partNumber++,
+                buffer
+            }
+        }
+
+        await sleep(100);
+        return this.getChunk();
+    }
+
+}
+
 /**
  * A custom file class that mimics the browser's File class.<br/>
  * You should use this whenever you want to upload a file.
@@ -48,6 +230,7 @@ export class CustomFile {
     path: string;
     /** in case of the no path a buffer can instead be passed instead to upload. */
     buffer?: Buffer;
+
 
     constructor(name: string, size: number, path: string, buffer?: Buffer) {
         this.name = name;
@@ -92,134 +275,35 @@ class CustomBuffer {
 
 const KB_TO_BYTES = 1024;
 const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024;
-const UPLOAD_TIMEOUT = 15 * 1000;
 const DISCONNECT_SLEEP = 1000;
-const BUFFER_SIZE_2GB = 2 ** 31;
 
-async function getFileBuffer(
-    file: File | CustomFile,
-    fileSize: number,
-    maxBufferSize: number
-): Promise<CustomBuffer> {
-    const options: CustomBufferOptions = {};
-    if (fileSize > maxBufferSize && file instanceof CustomFile) {
-        options.filePath = file.path;
-    } else {
-        options.buffer = Buffer.from(await fileToBuffer(file));
-    }
-
-    return new CustomBuffer(options);
-}
 
 /** @hidden */
 export async function uploadFile(
     client: TelegramClient,
     fileParams: UploadFileParams
 ): Promise<Api.InputFile | Api.InputFileBig> {
-    const { file, onProgress } = fileParams;
-    let { workers } = fileParams;
-
+    const { file, workers, onProgress } = fileParams;
     const { name, size } = file;
-    const fileId = readBigIntFromBuffer(generateRandomBytes(8), true, true);
+    const uploadHandler = new UploadHandler(file, workers, onProgress);
     const isLarge = size > LARGE_FILE_THRESHOLD;
-
-    const partSize = getAppropriatedPartSize(bigInt(size)) * KB_TO_BYTES;
-    const partCount = Math.floor((size + partSize - 1) / partSize);
-    const buffer = await getFileBuffer(
-        file,
-        size,
-        fileParams.maxBufferSize || BUFFER_SIZE_2GB - 1
-    );
 
     // Make sure a new sender can be created before starting upload
     await client.getSender(client.session.dcId);
-
-    if (!workers || !size) {
-        workers = 1;
-    }
-    if (workers >= partCount) {
-        workers = partCount;
-    }
-
-    let progress = 0;
-    if (onProgress) {
-        onProgress(progress);
-    }
-
-    for (let i = 0; i < partCount; i += workers) {
-        const sendingParts = [];
-        let end = i + workers;
-        if (end > partCount) {
-            end = partCount;
-        }
-
-        for (let j = i; j < end; j++) {
-            const bytes = await buffer.slice(j * partSize, (j + 1) * partSize);
-
-            // eslint-disable-next-line no-loop-func
-            sendingParts.push(
-                (async (jMemo: number, bytesMemo: Buffer) => {
-                    while (true) {
-                        let sender;
-                        try {
-                            // We always upload from the DC we are in
-                            sender = await client.getSender(
-                                client.session.dcId
-                            );
-                            await sender.send(
-                                isLarge
-                                    ? new Api.upload.SaveBigFilePart({
-                                          fileId,
-                                          filePart: jMemo,
-                                          fileTotalParts: partCount,
-                                          bytes: bytesMemo,
-                                      })
-                                    : new Api.upload.SaveFilePart({
-                                          fileId,
-                                          filePart: jMemo,
-                                          bytes: bytesMemo,
-                                      })
-                            );
-                        } catch (err: any) {
-                            if (sender && !sender.isConnected()) {
-                                await sleep(DISCONNECT_SLEEP);
-                                continue;
-                            } else if (err instanceof errors.FloodWaitError) {
-                                await sleep(err.seconds * 1000);
-                                continue;
-                            }
-                            throw err;
-                        }
-
-                        if (onProgress) {
-                            if (onProgress.isCanceled) {
-                                throw new Error("USER_CANCELED");
-                            }
-
-                            progress += 1 / partCount;
-                            onProgress(progress);
-                        }
-                        break;
-                    }
-                })(j, bytes)
-            );
-        }
-
-        await Promise.all(sendingParts);
-    }
+    await uploadHandler.start(client);
 
     return isLarge
         ? new Api.InputFileBig({
-              id: fileId,
-              parts: partCount,
-              name,
-          })
+            id: uploadHandler.id,
+            parts: uploadHandler.partCount,
+            name,
+        })
         : new Api.InputFile({
-              id: fileId,
-              parts: partCount,
-              name,
-              md5Checksum: "", // This is not a "flag", so not sure if we can make it optional.
-          });
+            id: uploadHandler.id,
+            parts: uploadHandler.partCount,
+            name,
+            md5Checksum: "", // This is not a "flag", so not sure if we can make it optional.
+        });
 }
 
 /**
@@ -737,18 +821,4 @@ export async function sendFile(
     });
     const result = await client.invoke(request);
     return client._getResponseMessage(request, result, entity) as Api.Message;
-}
-
-function fileToBuffer(file: File | CustomFile): Promise<Buffer> | Buffer {
-    if (typeof File !== "undefined" && file instanceof File) {
-        return new Response(file).arrayBuffer() as Promise<Buffer>;
-    } else if (file instanceof CustomFile) {
-        if (file.buffer != undefined) {
-            return file.buffer;
-        } else {
-            return fs.readFile(file.path) as unknown as Buffer;
-        }
-    } else {
-        throw new Error("Could not create buffer from file " + file);
-    }
 }
